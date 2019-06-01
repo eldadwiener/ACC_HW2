@@ -321,7 +321,7 @@ int main(int argc, char *argv[]) {
         //TODO, maybe need to move mem free further down
         for(int i = 0; i < 64; ++i)
         {
-        CUDA_CHECK(cudaStreamDestroy(stream[i]));    
+        CUDA_CHECK(cudaStreamDestroy(streams[i]));    
         CUDA_CHECK(cudaFree(gpu_image_in[i]));
         CUDA_CHECK(cudaFree(gpu_image_out[i]));
         }
