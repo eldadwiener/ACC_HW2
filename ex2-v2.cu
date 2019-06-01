@@ -290,7 +290,7 @@ int main(int argc, char *argv[]) {
             /* TODO query (don't block) streams for any completed requests.
              * update req_t_end of completed requests
              */
-            cudaStream_t availStream = -1;
+            int availStream = -1;
             for(int i=0; i < 64; ++i)
             {
                 if(cudaStreamQuery(streams[i]) == cudaSuccess)
@@ -312,12 +312,19 @@ int main(int argc, char *argv[]) {
             req_t_start[img_idx] = get_time_msec();
 
             /* TODO place memcpy's and kernels in a stream */
-            cudaMemcpyAsync(gpu_image_in[availStream], images_in[img_idx * SQR(IMG_DIMENSION)], SQR(IMG_DIMENSION),cudaMemcpyHostToDevice,streams[availStream]);
+            cudaMemcpyAsync(gpu_image_in[availStream], &images_in[img_idx * SQR(IMG_DIMENSION)], SQR(IMG_DIMENSION),cudaMemcpyHostToDevice,streams[availStream]);
             gpu_process_image<<<1, SQR(IMG_DIMENSION) ,0, streams[availStream]>>>(gpu_image_in[availStream], gpu_image_out[availStream]);
-            cudaMemcpyAsync(images_out_from_gpu[img_idx * SQR(IMG_DIMENSION)], gpu_image_out[availStream], SQR(IMG_DIMENSION),cudaMemcpyDeviceToHost,streams[availStream]);
+            cudaMemcpyAsync(&images_out_from_gpu[img_idx * SQR(IMG_DIMENSION)], gpu_image_out[availStream], SQR(IMG_DIMENSION),cudaMemcpyDeviceToHost,streams[availStream]);
         }
         /* TODO now make sure to wait for all streams to finish */
-        cudaDeviceSynchronize()
+        cudaDeviceSynchronize();
+        //TODO, maybe need to move mem free further down
+        for(int i = 0; i < 64; ++i)
+        {
+        CUDA_CHECK(cudaStreamDestroy(stream[i]));    
+        CUDA_CHECK(cudaFree(gpu_image_in[i]));
+        CUDA_CHECK(cudaFree(gpu_image_out[i]));
+        }
 
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
