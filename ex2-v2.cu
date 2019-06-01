@@ -9,7 +9,7 @@
 
 ///////////////////////////////////////////////// DO NOT CHANGE ///////////////////////////////////////
 #define IMG_DIMENSION 32
-#define NREQUESTS 65
+#define NREQUESTS 10000
 
 typedef unsigned char uchar;
 
@@ -106,6 +106,23 @@ void load_images(uchar *images) {
 }
 
 __device__ int arr_min(int arr[], int arr_size) {
+    // we assume arr_size threads call this function for arr[]
+    __shared__ int SharedMin;
+    int tid = threadIdx.x;
+    for(int stride = 0; stride < arr_size; stride += blockDim.x)
+    {
+        if( (tid + stride < arr_size) && 
+            (arr[tid + stride] > 0) && 
+            ((tid + stride == 0) || (arr[tid + stride - 1] == 0))) // cdf is a rising function, so only the first non zero will have zero before it.
+        {
+            SharedMin = arr[tid + stride];
+        }
+        __syncthreads();
+    }
+    return SharedMin;
+}
+
+__device__ int arr_min_ref(int arr[], int arr_size) {
     int tid = threadIdx.x;
     int rhs, lhs;
 
@@ -193,7 +210,53 @@ void print_usage_and_die(char *progname) {
     exit(1);
 }
 
+int _min(int a, int b) {
+    return (a<b) ? a : b;
+}
 
+unsigned int getTBlocksAmnt(int threadsPerBlock, int shmemPerBlock) {
+    struct cudaDeviceProp props;
+    CUDA_CHECK( cudaGetDeviceProperties(&props, 0) );
+    int  ThreadsPerSM = min(props.maxThreadsPerMultiProcessor, props.regsPerMultiprocessor/32);
+    int  SMCount = props.multiProcessorCount;
+    size_t  shmemPerSM = props.sharedMemPerMultiprocessor;
+    return SMCount * min( ThreadsPerSM/threadsPerBlock, (unsigned int)shmemPerSM/shmemPerBlock);
+}
+
+#define QSIZE 10
+typedef struct QmetaData {
+    int tail;
+    int head;
+    int size;
+}QmetaData;
+
+typedef struct pcQ {
+    QmetaData* meta;
+    uchar** queue;
+    bool* usedCells;
+}pcQ;
+
+__host__ void setQ(pcQ& queue, void* allocated, unsigned int buffsize) {
+    queue.meta = (QmetaData*)allocated;
+    queue.meta->size = buffsize;
+    queue.queue = (uchar**)(queue.meta + sizeof(QmetaData));
+    queue.usedCells = (bool*)(queue.queue + queue.meta->size);
+} 
+
+__device__ void setQ(pcQ& queue, void* allocated) {
+    queue.meta = (QmetaData*)allocated;
+    queue.queue = (uchar**)(queue.meta + sizeof(QmetaData));
+    queue.usedCells = (bool*)(queue.queue + queue.meta->size);
+}
+
+
+__global__ void gpu_process_image_pc(void* in,void* out) {
+    // parse given pointers into useful structs
+    pcQ inQ, outQ;
+    setQ(inQ, in);
+    setQ(outQ, out);
+    printf("%d\n",inQ.meta->size);
+}
 enum {PROGRAM_MODE_STREAMS = 0, PROGRAM_MODE_QUEUE};
 int main(int argc, char *argv[]) {
 
@@ -339,6 +402,25 @@ int main(int argc, char *argv[]) {
 
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
+        unsigned int tblocks = getTBlocksAmnt(threads_queue_mode, 2*4*256+256+4);
+        // Queue needs metadata, "used cell" array, img queue array
+        unsigned int QallocSize = sizeof(QmetaData) + QSIZE * tblocks * sizeof(bool)
+                                                     + QSIZE * tblocks * SQR(IMG_DIMENSION) ;
+        void *imagesQinHost, *imagesQinDev;
+        void *imagesQoutHost, *imagesQoutDev;
+        CUDA_CHECK( cudaHostAlloc(&imagesQinHost, QallocSize , 0) );
+        CUDA_CHECK( cudaHostAlloc(&imagesQoutHost, QallocSize , 0) );
+        memset(imagesQinHost, 0, QallocSize);
+        memset(imagesQoutHost, 0, QallocSize);
+        // convert the queue pointers into useful pointers
+        pcQ inQ,outQ;
+        setQ(inQ, imagesQinHost, QSIZE * tblocks * SQR(IMG_DIMENSION));
+        setQ(outQ, imagesQoutHost, QSIZE * tblocks * SQR(IMG_DIMENSION));
+        // get GPU pointers and invoke the kernel
+        CUDA_CHECK( cudaHostGetDevicePointer(&imagesQinDev, imagesQinHost, 0) );
+        CUDA_CHECK( cudaHostGetDevicePointer(&imagesQoutDev, imagesQoutHost, 0) );
+        gpu_process_image_pc<<<tblocks, threads_queue_mode>>>(imagesQinDev,imagesQoutDev);
+        cudaDeviceSynchronize();
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             /* TODO check producer consumer queue for any responses.
              * don't block. if no responses are there we'll check again in the next iteration
