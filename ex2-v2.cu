@@ -9,7 +9,7 @@
 
 ///////////////////////////////////////////////// DO NOT CHANGE ///////////////////////////////////////
 #define IMG_DIMENSION 32
-#define NREQUESTS 10000
+#define NREQUESTS 65
 
 typedef unsigned char uchar;
 
@@ -300,6 +300,7 @@ int main(int argc, char *argv[]) {
                     if(imgInStream[i] > -1)
                     {    
                         req_t_end[imgInStream[i]] = get_time_msec();
+                        //printf("Img num: %d, start time: %f, end time: %f\n",imgInStream[i],req_t_start[imgInStream[i]],req_t_end[imgInStream[i]]); // REMOVE DEBUG
                         imgInStream[i] = -1;
                     }
                 }
@@ -308,7 +309,8 @@ int main(int argc, char *argv[]) {
                 --img_idx;
                 continue;
             }
-
+            //printf("Sending img id: %d to stream id: %d\n",img_idx, availStream); // REMOVE DEBUG
+            imgInStream[availStream] = img_idx;
             req_t_start[img_idx] = get_time_msec();
 
             /* TODO place memcpy's and kernels in a stream */
@@ -318,6 +320,15 @@ int main(int argc, char *argv[]) {
         }
         /* TODO now make sure to wait for all streams to finish */
         cudaDeviceSynchronize();
+        // Mark all remaining images end time to now
+        double endTime = get_time_msec();
+        for(int i = 0; i < 64 ; ++i)
+        {
+            if(imgInStream[i] > -1)
+            {
+                req_t_end[imgInStream[i]] = endTime;
+            }
+        }
         //TODO, maybe need to move mem free further down
         for(int i = 0; i < 64; ++i)
         {
@@ -355,6 +366,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < NREQUESTS; i++) {
         avg_latency += (req_t_end[i] - req_t_start[i]);
     }
+    //printf("Total latency: %f\n",avg_latency); // REMOVE DEBUG
     avg_latency /= NREQUESTS;
 
     printf("mode = %s\n", mode == PROGRAM_MODE_STREAMS ? "streams" : "queue");
