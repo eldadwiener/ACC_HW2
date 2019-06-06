@@ -9,7 +9,7 @@
 
 ///////////////////////////////////////////////// DO NOT CHANGE ///////////////////////////////////////
 #define IMG_DIMENSION 32
-#define NREQUESTS 10000
+#define NREQUESTS 1
 
 typedef unsigned char uchar;
 
@@ -229,6 +229,7 @@ typedef struct QmetaData {
     int tail;
     int head;
     int size;
+    bool done;
 } QmetaData;
 
 typedef struct jobS* pJobS;
@@ -253,6 +254,7 @@ __host__ void setQ(pcQ& queue, void* allocated, unsigned int Qsize) {
     queue.meta->size = Qsize;
     queue.meta->head = 0;
     queue.meta->tail = 0;
+    queue.meta->done = false;
     queue.queue = (pJobS)(queue.meta + 1);
     queue.usedCells = (int*)( queue.queue + queue.meta->size );
     for (int i = 0; i < queue.meta->size; ++i ){
@@ -282,7 +284,15 @@ __global__ void gpu_process_image_pc(void* in,void* out, tbMem* tb_mem) {
     int* jobUsedCellPtr;
     unsigned int currJobId;
     int QbuffNum = inQ.meta->size;
-    while (true){
+    while (true){ // -1 means no more images
+        // if Q is empty and cpu is done, exit the kernel
+        if(tid == 0)
+        {
+        printf("tail: %d, head: %d, done: %d\n",inQ.meta->tail, inQ.meta->head, inQ.meta->done);
+        }
+        return;
+        if(inQ.meta->tail == inQ.meta->head && inQ.meta->done)
+            return;
         //try to catch a buffer
         if (tid == 0){
             while(atomicCAS(&(inQ.usedCells[inQ.meta->tail % QbuffNum]), 1 ,2) != 1);
@@ -519,14 +529,13 @@ int main(int argc, char *argv[]) {
         CUDA_CHECK( cudaHostGetDevicePointer(&imagesQinDev, imagesQinHost, 0) );
         CUDA_CHECK( cudaHostGetDevicePointer(&imagesQoutDev, imagesQoutHost, 0) );
         gpu_process_image_pc<<<tblocks, threads_queue_mode>>>(imagesQinDev, imagesQoutDev, tb_mem);
-        cudaDeviceSynchronize();
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             /* TODO check producer consumer queue for any responses.
              * don't block. if no responses are there we'll check again in the next iteration
              * update req_t_end of completed requests 
              */
-            while (((outQ.meta->tail % QbuffNum) < (outQ.meta->head % QbuffNum)) &&
-                    (outQ.usedCells[inQ.meta->tail% QbuffNum] == 1))
+            printf("checking if theres room for img: %d\n",img_idx);
+            while (outQ.usedCells[inQ.meta->tail% QbuffNum] == 1)
             {
                 int job = outQ.queue[outQ.meta->tail%QbuffNum].jobId;
                 CUDA_CHECK( cudaMemcpy(images_out_from_gpu + (job * SQR(IMG_DIMENSION)), outQ.queue[outQ.meta->tail % QbuffNum].job,
@@ -535,8 +544,7 @@ int main(int argc, char *argv[]) {
                 outQ.meta->tail++;
                 req_t_end[job] = get_time_msec();
             }
-            if( (inQ.meta->head % QbuffNum == inQ.meta->tail % QbuffNum) || // if inQ is full 
-                (inQ.usedCells[inQ.meta->head% QbuffNum] != 0) || //the next cell isn't empty    
+            if( (inQ.usedCells[inQ.meta->head% QbuffNum] != 0) || //the next cell isn't empty    
                (!rate_limit_can_send(&rate_limit)) )
             {
                 --img_idx;
@@ -546,12 +554,14 @@ int main(int argc, char *argv[]) {
             /* TODO push task to queue */
             printf("pushing img num: %d\n",img_idx);
             inQ.queue[inQ.meta->head % QbuffNum].jobId = img_idx;
-            CUDA_CHECK( cudaMemcpy(inQ.queue[inQ.meta->head % QbuffNum].job, images_in + (img_idx * SQR(IMG_DIMENSION)),
-                       SQR(IMG_DIMENSION), cudaMemcpyHostToHost));
+            /*CUDA_CHECK( cudaMemcpy(inQ.queue[inQ.meta->head % QbuffNum].job, images_in + (img_idx * SQR(IMG_DIMENSION)),
+                       SQR(IMG_DIMENSION), cudaMemcpyHostToHost)); */
+            memcpy(inQ.queue[inQ.meta->head % QbuffNum].job, images_in + (img_idx * SQR(IMG_DIMENSION)), SQR(IMG_DIMENSION));
             inQ.usedCells[inQ.meta->head%QbuffNum] = 1; //the cell is ready to calc
             inQ.meta->head ++;
         }
         /* TODO wait until you have responses for all requests */
+        inQ.meta->done = true;
         cudaDeviceSynchronize();
         // Mark all remaining images end time to now
         double endTime = get_time_msec();
