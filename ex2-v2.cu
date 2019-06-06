@@ -238,6 +238,14 @@ typedef struct jobS {
     unsigned int jobId;
 } jobS;
 
+//TODO maybe remove?
+typedef struct singleQ {
+    jobS jobs[QSIZE];
+    int head;
+    int tail;
+    bool done;
+} Q;
+
 typedef struct pcQ {
     QmetaData* meta;
     pJobS queue;
@@ -369,6 +377,77 @@ __global__ void gpu_process_image_pc(void* in,void* out, tbMem* tb_mem) {
     }
 }
 
+
+__global__ void gpu_process_image_pc2(void* in,void* out) {
+    __shared__ int histogram[256];
+    __shared__ int hist_min[256];
+
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    uchar * jobQptr;
+    unsigned int currJobId;
+    Q *inQ = (Q*)in, *outQ = (Q*)out;
+    inQ += bid;
+    outQ += bid;
+    while (!(inQ->done && inQ->tail == inQ->head) ){ 
+        __shared__ bool stop;
+        stop = false;
+        while(inQ->tail >= inQ->head)
+        {
+            if(inQ->done) {
+                stop = true;
+                break;
+            }
+        }
+        __threadfence();
+        if(stop) break;
+        //save the job ptr and the job id
+        jobQptr = inQ->jobs[inQ->tail % QSIZE].job;
+        currJobId = inQ->jobs[inQ->tail % QSIZE].jobId;
+        /*----------------------------------------------------------------------------*/
+        /*do here the copy*/
+        //
+        //
+        //do the calcs
+        if (tid < 256) {
+            histogram[tid] = 0;
+        }
+        __syncthreads();
+    
+        for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x)
+            atomicAdd(&histogram[jobQptr[i]], 1);
+    
+        __syncthreads();
+    
+        prefix_sum(histogram, 256);
+    
+        if (tid < 256) {
+            hist_min[tid] = histogram[tid];
+        }
+        __syncthreads();
+    
+        int cdf_min = arr_min(hist_min, 256);
+    
+        __shared__ uchar map[256];
+        if (tid < 256) {
+            int map_value = (float)(histogram[tid] - cdf_min) / (SQR(IMG_DIMENSION) - cdf_min) * 255;
+            map[tid] = (uchar)map_value;
+        }
+    
+        __syncthreads();
+        while(!(outQ->head - outQ->tail < QSIZE)); 
+        for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x) {
+            outQ->jobs[outQ->head % QSIZE].job[i] = map[jobQptr[i]];
+        }
+        outQ->jobs[outQ->head % QSIZE].jobId = currJobId; 
+        // try to catch free cell in Qout and copy the result
+        if (tid == 0){
+            //save the job-out ptr and insert the job id
+            outQ->head ++;
+            inQ->tail ++;
+        }
+    }
+}
 
 enum {PROGRAM_MODE_STREAMS = 0, PROGRAM_MODE_QUEUE};
 int main(int argc, char *argv[]) {
@@ -516,8 +595,77 @@ int main(int argc, char *argv[]) {
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
         unsigned int tblocks = getTBlocksAmnt(threads_queue_mode, 2*4*256+256+4);
-        tblocks = 1;
-        unsigned int QbuffNum = QSIZE * tblocks;
+        tblocks = 1; // TODO REMOVE
+        Q *QinHost, *QinDev;
+        Q *QoutHost, *QoutDev;
+        CUDA_CHECK( cudaHostAlloc(&QinHost, sizeof(Q)*tblocks , 0) );
+        CUDA_CHECK( cudaHostAlloc(&QoutHost, sizeof(Q)*tblocks , 0) );
+        memset(QinHost, 0, sizeof(Q)*tblocks);
+        memset(QoutHost, 0, sizeof(Q)*tblocks);
+        CUDA_CHECK( cudaHostGetDevicePointer(&QinDev, QinHost, 0) );
+        CUDA_CHECK( cudaHostGetDevicePointer(&QoutDev, QoutHost, 0) );
+        gpu_process_image_pc2<<<tblocks, threads_queue_mode>>>(QinDev, QoutDev);
+        for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
+
+            // check each tblock's out queue
+            for (int block = 0; block < tblocks; ++block)
+            {
+                while ( QoutHost[block].tail < QoutHost[block].head )
+                {
+                    jobS& job = QoutHost[block].jobs[QoutHost[block].tail % QSIZE ];
+                    memcpy(images_out_from_gpu + (job.jobId * SQR(IMG_DIMENSION)), job.job, SQR(IMG_DIMENSION) );
+                    QoutHost[block].tail++;
+                    req_t_end[job.jobId] = get_time_msec();
+                    printf("received completed job #%d\n",job.jobId);
+                }
+            }
+
+            printf("checking if theres room for img: %d\n",img_idx);
+            int blockToUse;
+            bool failed = true;
+            for (blockToUse = 0; blockToUse < tblocks; ++blockToUse)
+            {
+                if( QinHost[blockToUse].tail + QSIZE <= QinHost[blockToUse].head  || //the next cell isn't empty    
+                   (!rate_limit_can_send(&rate_limit)) )
+                {
+                    continue;
+                } 
+                failed = false;
+                break;
+            }
+            if ( failed )
+            {
+                img_idx--;
+                continue;
+            }
+            req_t_start[img_idx] = get_time_msec();
+            // TODO push task to queue 
+            printf("pushing img #%d, to threadblock #%d\n",img_idx, blockToUse);
+            jobS &inJob = QinHost[blockToUse].jobs[QinHost[blockToUse].head % QSIZE];
+            inJob.jobId = img_idx;
+            memcpy(inJob.job, images_in + (img_idx * SQR(IMG_DIMENSION)), SQR(IMG_DIMENSION));
+            QinHost[blockToUse].head ++;
+        }
+        // done, signal all threads to finish and stop 
+        for (int block = 0; block < tblocks; ++block)
+            QinHost[block].done = true;
+        cudaDeviceSynchronize();
+        // get the rest of the images to cpu
+        for (int block = 0; block < tblocks; ++block)
+        {
+            while ( QoutHost[block].tail < QoutHost[block].head )
+            {
+                jobS& job = QoutHost[block].jobs[QoutHost[block].tail % QSIZE ];
+                memcpy(images_out_from_gpu + (job.jobId * SQR(IMG_DIMENSION)), job.job, SQR(IMG_DIMENSION) );
+                QoutHost[block].tail++;
+                req_t_end[job.jobId] = get_time_msec();
+                printf("received completed job #%d\n",job.jobId);
+            }
+        }
+        cudaFreeHost(QinHost);
+        cudaFreeHost(QoutHost);
+        }
+        /*unsigned int QbuffNum = QSIZE * tblocks;
         unsigned int QbuffSize = QbuffNum * sizeof(jobS);
         // Queue needs metadata, "used cell" array, img queue array
         unsigned int QallocSize = sizeof(QmetaData) + QSIZE * tblocks * sizeof(int)
@@ -541,11 +689,12 @@ int main(int argc, char *argv[]) {
         CUDA_CHECK( cudaHostGetDevicePointer(&imagesQoutDev, imagesQoutHost, 0) );
         gpu_process_image_pc<<<tblocks, threads_queue_mode>>>(imagesQinDev, imagesQoutDev, tb_mem);
         int fails = 0; // TODO REMOVE
+        
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
-            /* TODO check producer consumer queue for any responses.
-             * don't block. if no responses are there we'll check again in the next iteration
-             * update req_t_end of completed requests 
-             */
+            // TODO check producer consumer queue for any responses.
+            // don't block. if no responses are there we'll check again in the next iteration
+            // update req_t_end of completed requests 
+            //
             //TODO REMOVE:
             printf("inQ.usedCells: [ %d %d %d %d %d %d %d %d %d %d ]\n", inQ.usedCells[0],inQ.usedCells[1],inQ.usedCells[2],inQ.usedCells[3],inQ.usedCells[4],inQ.usedCells[5],inQ.usedCells[6],inQ.usedCells[7],inQ.usedCells[8],inQ.usedCells[9]);
             printf("outQ.usedCells: [ %d %d %d %d %d %d %d %d %d %d ]\n", outQ.usedCells[0],outQ.usedCells[1],outQ.usedCells[2],outQ.usedCells[3],outQ.usedCells[4],outQ.usedCells[5],outQ.usedCells[6],outQ.usedCells[7],outQ.usedCells[8],outQ.usedCells[9]);
@@ -578,11 +727,11 @@ int main(int argc, char *argv[]) {
             }
             fails = 0; // TODO REMOVE
             req_t_start[img_idx] = get_time_msec();
-            /* TODO push task to queue */
+            // TODO push task to queue 
             printf("pushing img num: %d, head is %d\n",img_idx, inQ.meta->head);
             inQ.queue[inQ.meta->head % QbuffNum].jobId = img_idx;
-            /*CUDA_CHECK( cudaMemcpy(inQ.queue[inQ.meta->head % QbuffNum].job, images_in + (img_idx * SQR(IMG_DIMENSION)),
-                       SQR(IMG_DIMENSION), cudaMemcpyHostToHost)); */
+            //CUDA_CHECK( cudaMemcpy(inQ.queue[inQ.meta->head % QbuffNum].job, images_in + (img_idx * SQR(IMG_DIMENSION)),
+            //           SQR(IMG_DIMENSION), cudaMemcpyHostToHost));
             memcpy(inQ.queue[inQ.meta->head % QbuffNum].job, images_in + (img_idx * SQR(IMG_DIMENSION)), SQR(IMG_DIMENSION));
             inQ.usedCells[(inQ.meta->head) %QbuffNum] = 1; //the cell is ready to calc
             if(inQ.usedCells[inQ.meta->head % QbuffNum] != 1) // TODO REMOVE
@@ -592,7 +741,7 @@ int main(int argc, char *argv[]) {
             }
             inQ.meta->head ++;
         }
-        /* TODO wait until you have responses for all requests */
+        //  TODO wait until you have responses for all requests
         inQ.meta->done = true;
         cudaDeviceSynchronize();
         // Mark all remaining images end time to now
@@ -613,7 +762,7 @@ int main(int argc, char *argv[]) {
         cudaFreeHost(imagesQinHost);
         cudaFreeHost(imagesQoutHost);
 
-    } else {
+    }*/ else {
         assert(0);
     }
     double tf = get_time_msec();
