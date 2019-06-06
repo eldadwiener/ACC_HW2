@@ -233,20 +233,25 @@ typedef struct QmetaData {
 typedef struct pcQ {
     QmetaData* meta;
     uchar** queue;
-    bool* usedCells;
+    int* usedCells;
 }pcQ;
 
 __host__ void setQ(pcQ& queue, void* allocated, unsigned int buffsize) {
     queue.meta = (QmetaData*)allocated;
     queue.meta->size = buffsize;
+    queue.meta->head = 0;
+    queue.meta->tail = 0;
     queue.queue = (uchar**)(queue.meta + sizeof(QmetaData));
-    queue.usedCells = (bool*)(queue.queue + queue.meta->size);
+    queue.usedCells = (int*)(queue.queue + queue.meta->size);
+    for (int i = 0; i < queue.meta->size; ++i ){
+        queue.usedCells[i] = -1;
+    }
 } 
 
 __device__ void setQ(pcQ& queue, void* allocated) {
     queue.meta = (QmetaData*)allocated;
     queue.queue = (uchar**)(queue.meta + sizeof(QmetaData));
-    queue.usedCells = (bool*)(queue.queue + queue.meta->size);
+    queue.usedCells = (int*)(queue.queue + queue.meta->size);
 }
 
 
@@ -403,9 +408,11 @@ int main(int argc, char *argv[]) {
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
         unsigned int tblocks = getTBlocksAmnt(threads_queue_mode, 2*4*256+256+4);
+        unsigned int QbuffNum = QSIZE * tblocks * SQR(IMG_DIMENSION);
         // Queue needs metadata, "used cell" array, img queue array
-        unsigned int QallocSize = sizeof(QmetaData) + QSIZE * tblocks * sizeof(bool)
-                                                     + QSIZE * tblocks * SQR(IMG_DIMENSION) ;
+        unsigned int QallocSize = sizeof(QmetaData) + QSIZE * tblocks * sizeof(int)
+                                                     + QbuffNum ;
+        
         void *imagesQinHost, *imagesQinDev;
         void *imagesQoutHost, *imagesQoutDev;
         CUDA_CHECK( cudaHostAlloc(&imagesQinHost, QallocSize , 0) );
@@ -426,7 +433,7 @@ int main(int argc, char *argv[]) {
              * don't block. if no responses are there we'll check again in the next iteration
              * update req_t_end of completed requests 
              */
-
+            while ()
             if (!rate_limit_can_send(&rate_limit)) {
                 --img_idx;
                 continue;
