@@ -253,17 +253,17 @@ __host__ void setQ(pcQ& queue, void* allocated, unsigned int Qsize) {
     queue.meta->size = Qsize;
     queue.meta->head = 0;
     queue.meta->tail = 0;
-    queue.queue = (pJobS)(queue.meta + sizeof(QmetaData));
-    queue.usedCells = (int*)( queue.queue + ( queue.meta->size * sizeof(jobS) ) );
+    queue.queue = (pJobS)(queue.meta + 1);
+    queue.usedCells = (int*)( queue.queue + queue.meta->size );
     for (int i = 0; i < queue.meta->size; ++i ){
-        queue.usedCells[i] = -1;
+        queue.usedCells[i] = 0;
     }
 } 
 
 __device__ void setQ(pcQ& queue, void* allocated) {
     queue.meta = (QmetaData*)allocated;
-    queue.queue = (pJobS)(queue.meta + sizeof(QmetaData));
-    queue.usedCells = (int*)( queue.queue + ( queue.meta->size * sizeof(jobS) ) );
+    queue.queue = (pJobS)(queue.meta + 1);
+    queue.usedCells = (int*)( queue.queue + queue.meta->size );
 }
 
 
@@ -287,13 +287,13 @@ __global__ void gpu_process_image_pc(void* in,void* out, tbMem* tb_mem) {
         if (tid == 0){
             while(atomicCAS(&(inQ.usedCells[inQ.meta->tail % QbuffNum]), 1 ,2) != 1);
             //save the job ptr and the job id
-            jobQptr = inQ.queue[inQ.meta->tail % QbuffNum]->job;
-            currJobId = inQ.queue[inQ.meta->tail % QbuffNum]->jobIdl;
+            jobQptr = inQ.queue[inQ.meta->tail % QbuffNum].job;
+            currJobId = inQ.queue[inQ.meta->tail % QbuffNum].jobId;
             jobUsedCellPtr = inQ.usedCells + (inQ.meta->tail % QbuffNum);
             //move the tail forward to allow athoer T.Bs to work
             inQ.meta->tail ++;
             /* ---------TODO: do this copy mor efficient---------------------------------*/
-            cudaMemcpy(currJob.memIn, jobQptr, SQR(IMG_DIMENSION), cudaMemcpyDeviceToDevice);
+            memcpy(currJob.memIn, jobQptr, SQR(IMG_DIMENSION));
             *jobUsedCellPtr = 0; //the cell is empty now
             /*----------------------------------------------------------------------------*/
         }
@@ -336,12 +336,12 @@ __global__ void gpu_process_image_pc(void* in,void* out, tbMem* tb_mem) {
         if (tid == 0){
             while(atomicCAS(&(outQ.usedCells[outQ.meta->head % QbuffNum]), 0 ,2) != 0);
             //save the job-out ptr and insert the job id
-            jobQptr = outQ.queue[outQ.meta->head % QbuffNum]->job;
-            outQ.queue[outQ.meta->head % QbuffNum]->jobId = currJobId;
+            jobQptr = outQ.queue[outQ.meta->head % QbuffNum].job;
+            outQ.queue[outQ.meta->head % QbuffNum].jobId = currJobId;
             jobUsedCellPtr = outQ.usedCells + (outQ.meta->head % QbuffNum);
             outQ.meta->head ++;
             /* ---------TODO: do this copy mor efficient---------------------------------*/
-            cudaMemcpy(jobQptr, currJob.memOut, SQR(IMG_DIMENSION), cudaMemcpyDeviceToDevice);
+            memcpy(jobQptr, currJob.memOut, SQR(IMG_DIMENSION));
             *jobUsedCellPtr = 1; //the cell is ready for read now
             /*----------------------------------------------------------------------------*/
         }
@@ -511,6 +511,7 @@ int main(int argc, char *argv[]) {
         pcQ inQ,outQ;
         setQ(inQ, imagesQinHost, QbuffNum);
         setQ(outQ, imagesQoutHost, QbuffNum);
+        printf("after setQ\n"); // debug TODO remove
         // alloc local mem to the T.Bs
         tbMem* tb_mem;
         CUDA_CHECK( cudaMalloc((void **)&tb_mem, tblocks * sizeof(tbMem)));
@@ -525,9 +526,9 @@ int main(int argc, char *argv[]) {
              * update req_t_end of completed requests 
              */
             while (((outQ.meta->tail % QbuffNum) < (outQ.meta->head % QbuffNum)) &&
-                    (usedCells[inQ.meta->tail% QbuffNum] == 1))
+                    (outQ.usedCells[inQ.meta->tail% QbuffNum] == 1))
             {
-                int job = outQ.queue[tail%QbuffNum].jobId;
+                int job = outQ.queue[outQ.meta->tail%QbuffNum].jobId;
                 CUDA_CHECK( cudaMemcpy(images_out_from_gpu + (job * SQR(IMG_DIMENSION)), outQ.queue[outQ.meta->tail % QbuffNum].job,
                            SQR(IMG_DIMENSION), cudaMemcpyHostToHost));
                 outQ.usedCells[outQ.meta->tail%QbuffNum] = 0; //the cell is empty
@@ -536,13 +537,14 @@ int main(int argc, char *argv[]) {
             }
             if( (inQ.meta->head % QbuffNum == inQ.meta->tail % QbuffNum) || // if inQ is full 
                 (inQ.usedCells[inQ.meta->head% QbuffNum] != 0) || //the next cell isn't empty    
-               (!rate_limit_can_send(&rate_limit))
+               (!rate_limit_can_send(&rate_limit)) )
             {
                 --img_idx;
                 continue;
             }
             req_t_start[img_idx] = get_time_msec();
             /* TODO push task to queue */
+            printf("pushing img num: %d\n",img_idx);
             inQ.queue[inQ.meta->head % QbuffNum].jobId = img_idx;
             CUDA_CHECK( cudaMemcpy(inQ.queue[inQ.meta->head % QbuffNum].job, images_in + (img_idx * SQR(IMG_DIMENSION)),
                        SQR(IMG_DIMENSION), cudaMemcpyHostToHost));
@@ -560,13 +562,14 @@ int main(int argc, char *argv[]) {
                 req_t_end[imgInStream[i]] = endTime;
             }
         }
+        // Free all gpu allocations
+        cudaFree(tb_mem);
+        cudaFreeHost(imagesQinHost);
+        cudaFreeHost(imagesQoutHost);
+
     } else {
         assert(0);
     }
-    // Free all gpu allocations
-    cudaFree(tb_mem);
-    cudaFreeHost(imagesQinHost);
-    cudaFreeHost(imagesQoutHost);
     double tf = get_time_msec();
 
     total_distance = distance_sqr_between_image_arrays(images_out, images_out_from_gpu);
