@@ -388,24 +388,23 @@ __global__ void gpu_process_image_pc2(volatile void* in,volatile void* out) {
     inQ += bid;
     outQ += bid;
     while (true) {
-        __threadfence_system();
+        __threadfence();
         while(inQ->tail >= inQ->head) __threadfence_system(); // wait for queue to contain a job
         //save the job ptr and the job id
-        __threadfence_system();
         jobQptr = inQ->jobs[inQ->tail % QSIZE].job;
-        __threadfence_system();
         currJobId = inQ->jobs[inQ->tail % QSIZE].jobId;
-        __threadfence_system();
         if(currJobId == DONEJOB) {
             __threadfence();
             return;
         }
-        __threadfence_system();
         /*----------------------------------------------------------------------------*/
         /*do here the copy*/
         //
         //
         //do the calcs
+
+        __threadfence();
+
         if (tid < 256) {
             histogram[tid] = 0;
         }
@@ -413,9 +412,8 @@ __global__ void gpu_process_image_pc2(volatile void* in,volatile void* out) {
     
         for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x)
         {
-            __threadfence_system();
+            __threadfence_system(); // needed to get currect image data
             atomicAdd(&histogram[jobQptr[i]], 1);
-            __threadfence_system();
         }
     
         __syncthreads();
@@ -436,29 +434,20 @@ __global__ void gpu_process_image_pc2(volatile void* in,volatile void* out) {
         }
     
         __syncthreads();
-        __threadfence_system();
         while(!(outQ->head - outQ->tail < QSIZE)) __threadfence_system();
-        __threadfence_system();
         for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x) {
-            __threadfence_system();
             outQ->jobs[outQ->head % QSIZE].job[i] = map[jobQptr[i]];
-            __threadfence_system();
         }
-        __threadfence_system();
         outQ->jobs[outQ->head % QSIZE].jobId = currJobId; 
         __threadfence_system();
         // try to catch free cell in Qout and copy the result
         if (tid == 0){
-            __threadfence_system();
             //save the job-out ptr and insert the job id
             outQ->head ++;
-            __threadfence_system();
             inQ->tail ++;
-            __threadfence_system();
             // printf("GPU: sent job #%d\n",currJobId);
         }
         __threadfence_system();
-        __syncthreads();
     }
 }
 
