@@ -10,7 +10,7 @@
 ///////////////////////////////////////////////// DO NOT CHANGE ///////////////////////////////////////
 #define IMG_DIMENSION 32
 #define NREQUESTS 100
-
+#define DONEJOB -1
 typedef unsigned char uchar;
 
 #define CUDA_CHECK(f) do {                                                                  \
@@ -235,7 +235,7 @@ typedef struct QmetaData {
 typedef struct jobS* pJobS;
 typedef struct jobS {
     uchar job[SQR(IMG_DIMENSION)];
-    unsigned int jobId;
+    int jobId;
 } jobS;
 
 //TODO maybe remove?
@@ -243,7 +243,6 @@ typedef struct singleQ {
     jobS jobs[QSIZE];
     int head;
     int tail;
-    bool done;
 } Q;
 
 typedef struct pcQ {
@@ -378,32 +377,29 @@ __global__ void gpu_process_image_pc(void* in,void* out, tbMem* tb_mem) {
 }
 
 
-__global__ void gpu_process_image_pc2(void* in,void* out) {
+__global__ void gpu_process_image_pc2(volatile void* in,volatile void* out) {
     __shared__ int histogram[256];
     __shared__ int hist_min[256];
-
     int tid = threadIdx.x;
     int bid = blockIdx.x;
     uchar * jobQptr;
-    unsigned int currJobId;
+    int currJobId;
     Q *inQ = (Q*)in, *outQ = (Q*)out;
     inQ += bid;
     outQ += bid;
-    while (!(inQ->done && inQ->tail == inQ->head) ){ 
-        __shared__ bool stop;
-        stop = false;
-        while(inQ->tail >= inQ->head)
-        {
-            if(inQ->done) {
-                stop = true;
-                break;
-            }
-        }
-        __threadfence();
-        if(stop) break;
+    while (true) {
+        __threadfence_system();
+        while(inQ->tail >= inQ->head) __threadfence_system(); // wait for queue to contain a job
         //save the job ptr and the job id
         jobQptr = inQ->jobs[inQ->tail % QSIZE].job;
+        __threadfence_system();
         currJobId = inQ->jobs[inQ->tail % QSIZE].jobId;
+        __threadfence_system();
+        if(currJobId == DONEJOB) {
+            __threadfence();
+            return;
+        }
+        __threadfence_system();
         /*----------------------------------------------------------------------------*/
         /*do here the copy*/
         //
@@ -435,17 +431,26 @@ __global__ void gpu_process_image_pc2(void* in,void* out) {
         }
     
         __syncthreads();
+        __threadfence_system();
         while(!(outQ->head - outQ->tail < QSIZE)); 
+        __threadfence_system();
         for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x) {
+            __threadfence_system();
             outQ->jobs[outQ->head % QSIZE].job[i] = map[jobQptr[i]];
         }
+        __threadfence_system();
         outQ->jobs[outQ->head % QSIZE].jobId = currJobId; 
         // try to catch free cell in Qout and copy the result
         if (tid == 0){
+            __threadfence_system();
             //save the job-out ptr and insert the job id
             outQ->head ++;
+            __threadfence_system();
             inQ->tail ++;
+            __threadfence_system();
+            printf("GPU: sent job #%d\n",currJobId);
         }
+        __threadfence_system();
     }
 }
 
@@ -595,7 +600,7 @@ int main(int argc, char *argv[]) {
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
         unsigned int tblocks = getTBlocksAmnt(threads_queue_mode, 2*4*256+256+4);
-        tblocks = 1; // TODO REMOVE
+        unsigned int amntRecv = 0;
         Q *QinHost, *QinDev;
         Q *QoutHost, *QoutDev;
         CUDA_CHECK( cudaHostAlloc(&QinHost, sizeof(Q)*tblocks , 0) );
@@ -612,19 +617,25 @@ int main(int argc, char *argv[]) {
             {
                 while ( QoutHost[block].tail < QoutHost[block].head )
                 {
+                    __sync_synchronize();
                     jobS& job = QoutHost[block].jobs[QoutHost[block].tail % QSIZE ];
+                    __sync_synchronize();
                     memcpy(images_out_from_gpu + (job.jobId * SQR(IMG_DIMENSION)), job.job, SQR(IMG_DIMENSION) );
+                    __sync_synchronize();
                     QoutHost[block].tail++;
+                    __sync_synchronize();
                     req_t_end[job.jobId] = get_time_msec();
+                    ++amntRecv;
                     printf("received completed job #%d\n",job.jobId);
                 }
             }
 
-            printf("checking if theres room for img: %d\n",img_idx);
+            //printf("checking if theres room for img: %d\n",img_idx);
             int blockToUse;
             bool failed = true;
             for (blockToUse = 0; blockToUse < tblocks; ++blockToUse)
             {
+                __sync_synchronize();
                 if( QinHost[blockToUse].tail + QSIZE <= QinHost[blockToUse].head  || //the next cell isn't empty    
                    (!rate_limit_can_send(&rate_limit)) )
                 {
@@ -641,27 +652,47 @@ int main(int argc, char *argv[]) {
             req_t_start[img_idx] = get_time_msec();
             // TODO push task to queue 
             printf("pushing img #%d, to threadblock #%d\n",img_idx, blockToUse);
+            __sync_synchronize();
             jobS &inJob = QinHost[blockToUse].jobs[QinHost[blockToUse].head % QSIZE];
+            __sync_synchronize();
             inJob.jobId = img_idx;
+            __sync_synchronize();
             memcpy(inJob.job, images_in + (img_idx * SQR(IMG_DIMENSION)), SQR(IMG_DIMENSION));
+            __sync_synchronize();
             QinHost[blockToUse].head ++;
+            __sync_synchronize();
         }
         // done, signal all threads to finish and stop 
         for (int block = 0; block < tblocks; ++block)
-            QinHost[block].done = true;
-        cudaDeviceSynchronize();
-        // get the rest of the images to cpu
-        for (int block = 0; block < tblocks; ++block)
         {
-            while ( QoutHost[block].tail < QoutHost[block].head )
+            __sync_synchronize();
+            QinHost[block].jobs[QinHost[block].head % QSIZE].jobId = DONEJOB;
+            __sync_synchronize();
+            ++QinHost[block].head;
+            __sync_synchronize();
+        }
+        printf("syncing\n");
+        __sync_synchronize();
+        // cudaDeviceSynchronize(); // TODO DO WE NEED THIS
+        printf("done syncing\n");
+        // get the rest of the images to cpu
+        while(amntRecv < NREQUESTS) {
+            for (int block = 0; block < tblocks; ++block)
             {
-                jobS& job = QoutHost[block].jobs[QoutHost[block].tail % QSIZE ];
-                memcpy(images_out_from_gpu + (job.jobId * SQR(IMG_DIMENSION)), job.job, SQR(IMG_DIMENSION) );
-                QoutHost[block].tail++;
-                req_t_end[job.jobId] = get_time_msec();
-                printf("received completed job #%d\n",job.jobId);
+                while ( QoutHost[block].tail < QoutHost[block].head )
+                {
+                    jobS& job = QoutHost[block].jobs[QoutHost[block].tail % QSIZE ];
+                    memcpy(images_out_from_gpu + (job.jobId * SQR(IMG_DIMENSION)), job.job, SQR(IMG_DIMENSION) );
+                    __sync_synchronize();
+                    QoutHost[block].tail++;
+                    __sync_synchronize();
+                    req_t_end[job.jobId] = get_time_msec();
+                    ++amntRecv;
+                    printf("received completed job #%d\n",job.jobId);
+                }
             }
         }
+        printf("In total received: %d jobs\n",amntRecv);
         cudaFreeHost(QinHost);
         cudaFreeHost(QoutHost);
         }
