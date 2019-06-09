@@ -225,158 +225,20 @@ unsigned int getTBlocksAmnt(int threadsPerBlock, int shmemPerBlock) {
 }
 
 #define QSIZE 10
-typedef struct QmetaData {
-    int tail;
-    int head;
-    int size;
-    bool done;
-} QmetaData;
-
 typedef struct jobS* pJobS;
 typedef struct jobS {
     uchar job[SQR(IMG_DIMENSION)];
     int jobId;
 } jobS;
 
-//TODO maybe remove?
 typedef struct singleQ {
     jobS jobs[QSIZE];
     int head;
     int tail;
 } Q;
 
-typedef struct pcQ {
-    QmetaData* meta;
-    pJobS queue;
-    int* usedCells;
-}pcQ;
 
-typedef struct tbMem {
-    uchar memIn[SQR(IMG_DIMENSION)];
-    uchar memOut[SQR(IMG_DIMENSION)];
-} tbMem;
-
-__host__ void setQ(pcQ& queue, void* allocated, unsigned int Qsize) {
-    queue.meta = (QmetaData*)allocated;
-    queue.meta->size = Qsize;
-    queue.meta->head = 0;
-    queue.meta->tail = 0;
-    queue.meta->done = false;
-    queue.queue = (pJobS)(queue.meta + 1);
-    queue.usedCells = (int*)( queue.queue + queue.meta->size );
-    for (int i = 0; i < queue.meta->size; ++i ){
-        queue.usedCells[i] = 0;
-    }
-} 
-
-__device__ void setQ(pcQ& queue, void* allocated) {
-    queue.meta = (QmetaData*)allocated;
-    queue.queue = (pJobS)(queue.meta + 1);
-    queue.usedCells = (int*)( queue.queue + queue.meta->size );
-}
-
-
-__global__ void gpu_process_image_pc(void* in,void* out, tbMem* tb_mem) {
-    __shared__ int histogram[256];
-    __shared__ int hist_min[256];
-
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
-    // parse given pointers into useful structs
-    pcQ inQ, outQ;
-    setQ(inQ, in);
-    setQ(outQ, out);
-    tbMem currJob = tb_mem[bid];
-    uchar * jobQptr;
-    int* jobUsedCellPtr;
-    unsigned int currJobId;
-    int QbuffNum = inQ.meta->size;
-    while (true){ 
-        // if Q is empty and cpu is done, exit the kernel
-        //try to catch a buffer
-        __shared__ bool stop;// TODO add to threadblock amnt calculation
-        stop = false;
-        while (tid == 0){
-            __threadfence();
-            while(atomicCAS(&(inQ.usedCells[inQ.meta->tail % QbuffNum]), 1 ,2) != 1)
-            {
-                if(inQ.meta->tail == inQ.meta->head && inQ.meta->done) {
-                    stop = true;
-                    break;
-                }
-            }
-            __threadfence();
-            if(stop) break;
-            int idx = inQ.meta->tail % QbuffNum;
-            //save the job ptr and the job id
-            jobQptr = inQ.queue[inQ.meta->tail % QbuffNum].job;
-            currJobId = inQ.queue[inQ.meta->tail % QbuffNum].jobId;
-            jobUsedCellPtr = inQ.usedCells + (inQ.meta->tail % QbuffNum);
-            //move the tail forward to allow athoer T.Bs to work
-            atomicAdd(&inQ.meta->tail,1);
-            /* ---------TODO: do this copy mor efficient---------------------------------*/
-            memcpy(currJob.memIn, jobQptr, SQR(IMG_DIMENSION));
-            __threadfence();
-            //*jobUsedCellPtr = 0; //the cell is empty now
-            inQ.usedCells[idx] = 0;
-            /*----------------------------------------------------------------------------*/
-            break;
-        }
-        __syncthreads(); //wait for thread 0 to catch a job
-        if (stop)
-            return;
-        /*do here the copy*/
-        //
-        //
-        //do the calcs
-        if (tid < 256) {
-            histogram[tid] = 0;
-        }
-        __syncthreads();
-    
-        for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x)
-            atomicAdd(&histogram[currJob.memIn[i]], 1);
-    
-        __syncthreads();
-    
-        prefix_sum(histogram, 256);
-    
-        if (tid < 256) {
-            hist_min[tid] = histogram[tid];
-        }
-        __syncthreads();
-    
-        int cdf_min = arr_min(hist_min, 256);
-    
-        __shared__ uchar map[256];
-        if (tid < 256) {
-            int map_value = (float)(histogram[tid] - cdf_min) / (SQR(IMG_DIMENSION) - cdf_min) * 255;
-            map[tid] = (uchar)map_value;
-        }
-    
-        __syncthreads();
-    
-        for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x) {
-            currJob.memOut[i] = map[currJob.memIn[i]];
-        }
-        // try to catch free cell in Qout and copy the result
-        if (tid == 0){
-            while(atomicCAS(&(outQ.usedCells[outQ.meta->head % QbuffNum]), 0 ,2) != 0);
-            //save the job-out ptr and insert the job id
-            jobQptr = outQ.queue[outQ.meta->head % QbuffNum].job;
-            outQ.queue[outQ.meta->head % QbuffNum].jobId = currJobId;
-            jobUsedCellPtr = outQ.usedCells + (outQ.meta->head % QbuffNum);
-            outQ.meta->head ++;
-            /* ---------TODO: do this copy mor efficient---------------------------------*/
-            memcpy(jobQptr, currJob.memOut, SQR(IMG_DIMENSION));
-            *jobUsedCellPtr = 1; //the cell is ready for read now
-            /*----------------------------------------------------------------------------*/
-        }
-    }
-}
-
-
-__global__ void gpu_process_image_pc2(volatile void* in,volatile void* out) {
+__global__ void gpu_process_image_pc(volatile void* in,volatile void* out) {
     __shared__ int histogram[256];
     __shared__ int hist_min[256];
     int tid = threadIdx.x;
@@ -527,7 +389,6 @@ int main(int argc, char *argv[]) {
     struct rate_limit_t rate_limit;
     rate_limit_init(&rate_limit, load, 0);
 
-    /* TODO allocate / initialize memory, streams, etc... */
     cudaStream_t streams[64];
     int imgInStream[64];
     uchar *gpu_image_in[64], *gpu_image_out[64];
@@ -585,7 +446,6 @@ int main(int argc, char *argv[]) {
                 req_t_end[imgInStream[i]] = endTime;
             }
         }
-        //TODO, maybe need to move mem free further down
         for(int i = 0; i < 64; ++i)
         {
         CUDA_CHECK(cudaStreamDestroy(streams[i]));    
@@ -594,7 +454,6 @@ int main(int argc, char *argv[]) {
         }
 
     } else if (mode == PROGRAM_MODE_QUEUE) {
-        // TODO launch GPU consumer-producer kernel
         unsigned int tblocks = getTBlocksAmnt(threads_queue_mode, 2*4*256+256);
         unsigned int amntRecv = 0;
         unsigned int nextIns = 0; // first candidate block for next img insert, to implement RR
@@ -606,7 +465,7 @@ int main(int argc, char *argv[]) {
         memset(QoutHost, 0, sizeof(Q)*tblocks);
         CUDA_CHECK( cudaHostGetDevicePointer(&QinDev, QinHost, 0) );
         CUDA_CHECK( cudaHostGetDevicePointer(&QoutDev, QoutHost, 0) );
-        gpu_process_image_pc2<<<tblocks, threads_queue_mode>>>(QinDev, QoutDev);
+        gpu_process_image_pc<<<tblocks, threads_queue_mode>>>(QinDev, QoutDev);
         __sync_synchronize();
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             __sync_synchronize();
@@ -618,9 +477,7 @@ int main(int argc, char *argv[]) {
                 {
                     __sync_synchronize();
                     jobS& job = QoutHost[block].jobs[QoutHost[block].tail % QSIZE ];
-                    // __sync_synchronize();
                     memcpy(images_out_from_gpu + (job.jobId * SQR(IMG_DIMENSION)), job.job, SQR(IMG_DIMENSION) );
-                    // __sync_synchronize();
                     QoutHost[block].tail++;
                     __sync_synchronize();
                     req_t_end[job.jobId] = get_time_msec();
@@ -640,12 +497,10 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < tblocks; ++i)
             {
                 blockToUse = (i + nextIns) % tblocks;
-                //__sync_synchronize();
                 if( QinHost[blockToUse].tail + QSIZE <= QinHost[blockToUse].head ) //the next cell isn't empty
                 {
                     continue;
                 } 
-                //__sync_synchronize();
                 failed = false;
                 break;
             }
@@ -654,10 +509,7 @@ int main(int argc, char *argv[]) {
                 img_idx--;
                 continue;
             }
-            // __sync_synchronize();
             req_t_start[img_idx] = get_time_msec();
-            // TODO push task to queue 
-            // printf("pushing img #%d, to threadblock #%d\n",img_idx, blockToUse);
             __sync_synchronize();
             jobS &inJob = QinHost[blockToUse].jobs[QinHost[blockToUse].head % QSIZE];
             inJob.jobId = img_idx;
@@ -676,11 +528,8 @@ int main(int argc, char *argv[]) {
             ++QinHost[block].head;
             __sync_synchronize();
         }
-        // printf("syncing\n");
         __sync_synchronize();
-        // printf("done syncing\n");
         // get the rest of the images to cpu
-        // printf("So far received: %d jobs\n",amntRecv);
         while(amntRecv < NREQUESTS) {
             for (int block = 0; block < tblocks; ++block)
             {
@@ -712,7 +561,6 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < NREQUESTS; i++) {
         avg_latency += (req_t_end[i] - req_t_start[i]);
     }
-    //printf("Total latency: %f\n",avg_latency); // REMOVE DEBUG
     avg_latency /= NREQUESTS;
 
     printf("mode = %s\n", mode == PROGRAM_MODE_STREAMS ? "streams" : "queue");
