@@ -364,7 +364,6 @@ __global__ void gpu_process_image_pc(void* in,void* out, tbMem* tb_mem) {
             while(atomicCAS(&(outQ.usedCells[outQ.meta->head % QbuffNum]), 0 ,2) != 0);
             //save the job-out ptr and insert the job id
             jobQptr = outQ.queue[outQ.meta->head % QbuffNum].job;
-            printf("GPU sending job #%d\n",outQ.queue[outQ.meta->head % QbuffNum].jobId); // TODO REMOVE
             outQ.queue[outQ.meta->head % QbuffNum].jobId = currJobId;
             jobUsedCellPtr = outQ.usedCells + (outQ.meta->head % QbuffNum);
             outQ.meta->head ++;
@@ -596,7 +595,7 @@ int main(int argc, char *argv[]) {
 
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
-        unsigned int tblocks = getTBlocksAmnt(threads_queue_mode, 2*4*256+256+4);
+        unsigned int tblocks = getTBlocksAmnt(threads_queue_mode, 2*4*256+256);
         unsigned int amntRecv = 0;
         unsigned int nextIns = 0; // first candidate block for next img insert, to implement RR
         Q *QinHost, *QinDev;
@@ -700,7 +699,6 @@ int main(int argc, char *argv[]) {
             }
         }
         __sync_synchronize();
-        printf("In total received: %d jobs\n",amntRecv);
         cudaFreeHost(QinHost);
         cudaFreeHost(QoutHost);
         }
