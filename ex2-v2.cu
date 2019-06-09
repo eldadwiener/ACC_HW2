@@ -598,6 +598,7 @@ int main(int argc, char *argv[]) {
         // TODO launch GPU consumer-producer kernel
         unsigned int tblocks = getTBlocksAmnt(threads_queue_mode, 2*4*256+256+4);
         unsigned int amntRecv = 0;
+        unsigned int nextIns = 0; // first candidate block for next img insert, to implement RR
         Q *QinHost, *QinDev;
         Q *QoutHost, *QoutDev;
         CUDA_CHECK( cudaHostAlloc(&QinHost, sizeof(Q)*tblocks , 0) );
@@ -618,31 +619,34 @@ int main(int argc, char *argv[]) {
                 {
                     __sync_synchronize();
                     jobS& job = QoutHost[block].jobs[QoutHost[block].tail % QSIZE ];
-                    __sync_synchronize();
+                    // __sync_synchronize();
                     memcpy(images_out_from_gpu + (job.jobId * SQR(IMG_DIMENSION)), job.job, SQR(IMG_DIMENSION) );
-                    __sync_synchronize();
+                    // __sync_synchronize();
                     QoutHost[block].tail++;
                     __sync_synchronize();
                     req_t_end[job.jobId] = get_time_msec();
-                    __sync_synchronize();
                     ++amntRecv;
                     // printf("received completed job #%d\n",job.jobId);
                 }
             }
-
+            // Check send rate limit
+            if (!rate_limit_can_send(&rate_limit))
+            {
+                --img_idx;
+                continue;
+            }
             //printf("checking if theres room for img: %d\n",img_idx);
             int blockToUse;
             bool failed = true;
-            for (blockToUse = 0; blockToUse < tblocks; ++blockToUse)
+            for (int i = 0; i < tblocks; ++i)
             {
-                __sync_synchronize();
-                if( QinHost[blockToUse].tail + QSIZE <= QinHost[blockToUse].head  || //the next cell isn't empty    
-                   (!rate_limit_can_send(&rate_limit)) )
+                blockToUse = (i + nextIns) % tblocks;
+                //__sync_synchronize();
+                if( QinHost[blockToUse].tail + QSIZE <= QinHost[blockToUse].head ) //the next cell isn't empty
                 {
-                    __sync_synchronize();
                     continue;
                 } 
-                __sync_synchronize();
+                //__sync_synchronize();
                 failed = false;
                 break;
             }
@@ -651,19 +655,18 @@ int main(int argc, char *argv[]) {
                 img_idx--;
                 continue;
             }
-            __sync_synchronize();
+            // __sync_synchronize();
             req_t_start[img_idx] = get_time_msec();
             // TODO push task to queue 
             // printf("pushing img #%d, to threadblock #%d\n",img_idx, blockToUse);
             __sync_synchronize();
             jobS &inJob = QinHost[blockToUse].jobs[QinHost[blockToUse].head % QSIZE];
-            __sync_synchronize();
             inJob.jobId = img_idx;
-            __sync_synchronize();
             memcpy(inJob.job, images_in + (img_idx * SQR(IMG_DIMENSION)), SQR(IMG_DIMENSION));
-            __sync_synchronize();
             QinHost[blockToUse].head ++;
             __sync_synchronize();
+
+            ++nextIns;
         }
         // done, signal all threads to finish and stop 
         for (int block = 0; block < tblocks; ++block)
@@ -676,13 +679,10 @@ int main(int argc, char *argv[]) {
         }
         // printf("syncing\n");
         __sync_synchronize();
-        // cudaDeviceSynchronize(); // TODO DO WE NEED THIS
         // printf("done syncing\n");
         // get the rest of the images to cpu
         // printf("So far received: %d jobs\n",amntRecv);
         while(amntRecv < NREQUESTS) {
-            cudaDeviceSynchronize();
-            __sync_synchronize();
             for (int block = 0; block < tblocks; ++block)
             {
                 __sync_synchronize();
@@ -690,9 +690,7 @@ int main(int argc, char *argv[]) {
                 {
                     __sync_synchronize();
                     jobS& job = QoutHost[block].jobs[QoutHost[block].tail % QSIZE ];
-                    __sync_synchronize();
                     memcpy(images_out_from_gpu + (job.jobId * SQR(IMG_DIMENSION)), job.job, SQR(IMG_DIMENSION) );
-                    __sync_synchronize();
                     QoutHost[block].tail++;
                     __sync_synchronize();
                     req_t_end[job.jobId] = get_time_msec();
